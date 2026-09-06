@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ytstack:signals:schema:analysis:v1",
+  "title": "Signals V1 Analysis Event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["specversion", "id", "source", "type", "subject", "time", "datacontenttype", "dataschema", "data"],
+  "properties": {
+    "specversion": {"const": "1.0"},
+    "id": {"type": "string", "minLength": 1},
+    "source": {"type": "string", "format": "uri-reference"},
+    "type": {"const": "io.ytstack.signals.analysis.updated.v1"},
+    "subject": {"type": "string", "minLength": 1},
+    "time": {"type": "string", "format": "date-time"},
+    "datacontenttype": {"const": "application/json"},
+    "dataschema": {"const": "urn:ytstack:signals:schema:analysis:v1"},
+    "data": {"$ref": "#/$defs/analysisData"}
+  },
+  "$defs": {
+    "analysisData": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["series", "bar", "analysis", "analysis_revision", "outputs", "ready", "implementation"],
+      "properties": {
+        "series": {"$ref": "#/$defs/series"},
+        "bar": {"$ref": "#/$defs/bar"},
+        "analysis": {"$ref": "#/$defs/analysis"},
+        "analysis_revision": {"type": "integer", "minimum": 0},
+        "outputs": {"type": "array", "items": {"$ref": "#/$defs/output"}},
+        "ready": {"type": "boolean"},
+        "samples": {"type": "integer", "minimum": 0},
+        "required_samples": {"type": "integer", "minimum": 1},
+        "implementation": {"$ref": "#/$defs/implementation"}
+      }
+    },
+    "series": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dataset", "symbol", "timeframe"],
+      "properties": {
+        "dataset": {"type": "string", "minLength": 1},
+        "symbol": {"type": "string", "minLength": 1},
+        "timeframe": {"type": "string", "pattern": "^[1-9][0-9]*[smhdw]$"}
+      }
+    },
+    "bar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["open_time", "close_time", "revision", "status"],
+      "properties": {
+        "open_time": {"type": "string", "format": "date-time"},
+        "close_time": {"type": "string", "format": "date-time"},
+        "revision": {"type": "integer", "minimum": 0},
+        "status": {"enum": ["confirmed", "provisional"]}
+      }
+    },
+    "analysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "parameters"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[a-z][a-z0-9._-]*$"},
+        "parameters": {"type": "object", "additionalProperties": true}
+      }
+    },
+    "implementation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine", "engine_version", "algorithm_version", "config_hash"],
+      "properties": {
+        "engine": {"type": "string", "minLength": 1},
+        "engine_version": {"type": "string", "minLength": 1},
+        "algorithm_version": {"type": "string", "minLength": 1},
+        "config_hash": {"type": "string", "minLength": 1}
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type", "value", "display"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[a-z][a-z0-9._-]*$"},
+        "type": {"enum": ["number", "text", "boolean", "points", "markers", "zones", "levels"]},
+        "unit": {"type": "string"},
+        "value": true,
+        "display": {"$ref": "#/$defs/display"}
+      },
+      "allOf": [
+        {"if": {"properties": {"type": {"const": "number"}}}, "then": {"properties": {"value": {"type": "number"}}}},
+        {"if": {"properties": {"type": {"const": "text"}}}, "then": {"properties": {"value": {"type": "string"}}}},
+        {"if": {"properties": {"type": {"const": "boolean"}}}, "then": {"properties": {"value": {"type": "boolean"}}}},
+        {"if": {"properties": {"type": {"enum": ["points", "markers"]}}}, "then": {"properties": {"value": {"type": "array", "items": {"$ref": "#/$defs/point"}}}}},
+        {"if": {"properties": {"type": {"const": "zones"}}}, "then": {"properties": {"value": {"type": "array", "items": {"$ref": "#/$defs/zone"}}}}},
+        {"if": {"properties": {"type": {"const": "levels"}}}, "then": {"properties": {"value": {"type": "array", "items": {"$ref": "#/$defs/level"}}}}}
+      ]
+    },
+    "display": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "pane"],
+      "properties": {
+        "kind": {"type": "string", "pattern": "^[a-z][a-z0-9._-]*$"},
+        "pane": {"type": "string", "minLength": 1},
+        "group": {"type": "string"},
+        "order": {"type": "integer"}
+      }
+    },
+    "direction": {"enum": ["bullish", "bearish", "neutral"]},
+    "attributes": {"type": "object", "additionalProperties": true},
+    "point": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "time"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "time": {"type": "string", "format": "date-time"},
+        "value": {"type": "number"},
+        "label": {"type": "string"},
+        "direction": {"$ref": "#/$defs/direction"},
+        "confirmed_at": {"type": "string", "format": "date-time"},
+        "attributes": {"$ref": "#/$defs/attributes"}
+      }
+    },
+    "zone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "start_time", "end_time", "upper", "lower"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "start_time": {"type": "string", "format": "date-time"},
+        "end_time": {"type": "string", "format": "date-time"},
+        "upper": {"type": "number"},
+        "lower": {"type": "number"},
+        "label": {"type": "string"},
+        "direction": {"$ref": "#/$defs/direction"},
+        "state": {"enum": ["pending", "active", "mitigated", "invalidated", "expired"]},
+        "attributes": {"$ref": "#/$defs/attributes"}
+      }
+    },
+    "level": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "value"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "value": {"type": "number"},
+        "label": {"type": "string"},
+        "direction": {"$ref": "#/$defs/direction"},
+        "attributes": {"$ref": "#/$defs/attributes"}
+      }
+    }
+  }
+}

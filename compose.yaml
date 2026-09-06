@@ -1,0 +1,70 @@
+services:
+  postgres:
+    image: docker.io/library/postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: "${SIGNALD_POSTGRES_DB:-signald}"
+      POSTGRES_USER: "${SIGNALD_POSTGRES_USER:-signald}"
+      POSTGRES_PASSWORD: "${SIGNALD_POSTGRES_PASSWORD:-signald-local-only}"
+    ports:
+      - "${SIGNALD_DB_BIND_ADDR:-127.0.0.1}:${SIGNALD_POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - signald-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [backend]
+    logging: &rotated-logs
+      driver: json-file
+      options:
+        max-size: "${SIGNALD_LOG_MAX_SIZE:-20m}"
+        max-file: "${SIGNALD_LOG_MAX_FILES:-5}"
+
+  signald:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${SIGNALD_HTTP_BIND_ADDR:-127.0.0.1}:${SIGNALD_HTTP_PORT:-8090}:8090"
+    environment:
+      SIGNALD_HTTP_ADDR: ":8090"
+      SIGNALD_DATABASE_URL: "postgres://${SIGNALD_POSTGRES_USER:-signald}:${SIGNALD_POSTGRES_PASSWORD:-signald-local-only}@postgres:5432/${SIGNALD_POSTGRES_DB:-signald}?sslmode=disable"
+      SIGNALD_DATABASE_MAX_CONNS: "${SIGNALD_DATABASE_MAX_CONNS:-10}"
+      SIGNALD_OHLC_WS_URL: "${SIGNALD_OHLC_WS_URL:-ws://host.docker.internal:8080/ws}"
+      SIGNALD_OHLC_TOKEN: "${SIGNALD_OHLC_TOKEN:-}"
+      SIGNALD_DATASET: "${SIGNALD_DATASET:-live}"
+      SIGNALD_SERIES: "${SIGNALD_SERIES:-BTCUSDT:1m,BTCUSDT:5m,BTCUSDT:15m,BTCUSDT:1h}"
+      SIGNALD_EMA_PERIODS: "${SIGNALD_EMA_PERIODS:-9,21,50,200}"
+      SIGNALD_SEED_BARS: "${SIGNALD_SEED_BARS:-500}"
+      SIGNALD_MAILBOX_SIZE: "${SIGNALD_MAILBOX_SIZE:-1024}"
+      SIGNALD_SNAPSHOT_EVERY: "${SIGNALD_SNAPSHOT_EVERY:-100}"
+      SIGNALD_API_TOKEN: "${SIGNALD_API_TOKEN:?set SIGNALD_API_TOKEN in .env}"
+      SIGNALD_ALLOWED_ORIGINS: "${SIGNALD_ALLOWED_ORIGINS:-http://127.0.0.1:8080,http://localhost:8080,http://127.0.0.1:8082,http://localhost:8082,http://127.0.0.1:18110,http://localhost:18110}"
+      SIGNALD_SHUTDOWN_TIMEOUT: "${SIGNALD_SHUTDOWN_TIMEOUT:-15s}"
+      SIGNALD_OUTBOX_POLL_INTERVAL: "${SIGNALD_OUTBOX_POLL_INTERVAL:-250ms}"
+      SIGNALD_LOG_LEVEL: "${SIGNALD_LOG_LEVEL:-info}"
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [backend]
+    logging: *rotated-logs
+
+volumes:
+  signald-postgres:
+    name: "${SIGNALD_POSTGRES_VOLUME:-signald_postgres-data}"
+
+networks:
+  backend:
+    name: "${SIGNALD_NETWORK:-signald_backend}"
