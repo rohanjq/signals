@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-09-06 - Container trust store
+
+- Install the repository-provided Zscaler root certificate in the Go build
+  stage so module downloads succeed on the local development network.
+- Copy the generated CA bundle into the distroless runtime image so outbound
+  HTTPS clients use the same trusted certificate chain.
+
 ## 2026-09-06 - Initial local release
 
 - Add the Go `signald` service for authoritative EMA and market analysis from
