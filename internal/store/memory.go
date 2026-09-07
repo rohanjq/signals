@@ -59,6 +59,16 @@ func (s *Memory) RebuildSeries(_ context.Context, key model.SeriesKey, events []
 			return fmt.Errorf("rebuilt series cursor would move backwards")
 		}
 	}
+	for storageKey := range s.snapshots {
+		if strings.HasPrefix(storageKey, key.String()+"|") {
+			delete(s.snapshots, storageKey)
+		}
+	}
+	for eventID, event := range s.points {
+		if event.Dataset == key.Dataset && event.Symbol == key.Symbol && event.Timeframe == key.Timeframe {
+			delete(s.points, eventID)
+		}
+	}
 	for _, event := range events {
 		s.persistEventState(event)
 	}
@@ -185,6 +195,14 @@ func (s *Memory) persistEventState(event model.SignalEvent) {
 	if event.EventType == "market.state" {
 		s.markets[marketKey(event)] = event
 		return
+	}
+	for eventID, existing := range s.points {
+		if existing.Dataset == event.Dataset && existing.Symbol == event.Symbol &&
+			existing.Timeframe == event.Timeframe && existing.BarOpenTime.Equal(event.BarOpenTime) &&
+			existing.BarRevision == event.BarRevision && eventPeriod(existing) == eventPeriod(event) &&
+			existing.Algorithm.Name == event.Algorithm.Name {
+			delete(s.points, eventID)
+		}
 	}
 	s.points[event.EventID] = event
 }

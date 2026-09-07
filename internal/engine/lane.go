@@ -192,7 +192,13 @@ func (l *Lane) applySeed(ctx context.Context, bars []model.Bar) error {
 	initialized := l.lastBar != nil
 	l.mu.RUnlock()
 	if initialized {
-		return l.applyCatchUpSeed(ctx, bars)
+		if err := l.applyCatchUpSeed(ctx, bars); err != nil {
+			// Reconnect seeds are authoritative too. Reconciliation may have
+			// corrected the current durable bar while this lane remained alive;
+			// rebuild instead of rejecting the same corrected seed forever.
+			return l.rebuildSeed(ctx, bars)
+		}
+		return nil
 	}
 	recovery, err := l.store.LoadRecovery(ctx, l.key)
 	if err != nil {
@@ -200,11 +206,17 @@ func (l *Lane) applySeed(ctx context.Context, bars []model.Bar) error {
 	}
 	if recovery.HasCursor {
 		if err := l.restoreRecoverySeed(recovery, bars); err != nil {
-			return err
+			// OHLC is authoritative. A corrected candle or a changed reducer set
+			// invalidates the saved checkpoint, so rebuild deterministically from
+			// the complete seed instead of reconnecting forever.
+			return l.rebuildSeed(ctx, bars)
 		}
 		return l.applyCatchUpSeed(ctx, bars)
 	}
+	return l.rebuildSeed(ctx, bars)
+}
 
+func (l *Lane) rebuildSeed(ctx context.Context, bars []model.Bar) error {
 	reducers, err := newReducers(l.periods)
 	if err != nil {
 		return err

@@ -160,6 +160,22 @@ func (s *Postgres) RebuildSeries(ctx context.Context, key model.SeriesKey, event
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", advisoryKey(key)); err != nil {
+		return fmt.Errorf("lock series rebuild: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM signal_reducer_snapshots
+		WHERE dataset=$1 AND symbol=$2 AND timeframe=$3`,
+		key.Dataset, key.Symbol, key.Timeframe); err != nil {
+		return fmt.Errorf("clear stale reducer snapshots: %w", err)
+	}
+	// Rebuild output is authoritative for this series. Remove points generated
+	// from a superseded OHLC seed so lower revision numbers from a historical
+	// correction cannot coexist with (and lose to) stale live revisions.
+	if _, err := tx.Exec(ctx, `DELETE FROM signal_indicator_points
+		WHERE dataset=$1 AND symbol=$2 AND timeframe=$3`,
+		key.Dataset, key.Symbol, key.Timeframe); err != nil {
+		return fmt.Errorf("clear stale indicator points: %w", err)
+	}
 	for _, event := range events {
 		if err := persistEventState(ctx, tx, event); err != nil {
 			return err
@@ -330,7 +346,9 @@ func insertPoint(ctx context.Context, tx pgx.Tx, event model.SignalEvent) error 
 	_, err := tx.Exec(ctx, `INSERT INTO signal_indicator_points
 		(event_id,dataset,symbol,timeframe,bar_open_time,bar_revision,indicator,period,value,samples,algorithm_version,config_hash)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-		ON CONFLICT (event_id) DO NOTHING`, event.EventID, event.Dataset, event.Symbol, event.Timeframe,
+		ON CONFLICT (dataset,symbol,timeframe,bar_open_time,bar_revision,indicator,period,algorithm_version,config_hash)
+		DO UPDATE SET event_id=EXCLUDED.event_id,value=EXCLUDED.value,samples=EXCLUDED.samples,
+			algorithm_version=EXCLUDED.algorithm_version,config_hash=EXCLUDED.config_hash`, event.EventID, event.Dataset, event.Symbol, event.Timeframe,
 		event.BarOpenTime, event.BarRevision, event.Algorithm.Name, event.Indicator.Period, event.Indicator.Value,
 		event.Indicator.Samples, event.Algorithm.Version, event.Algorithm.ConfigHash)
 	if err != nil {

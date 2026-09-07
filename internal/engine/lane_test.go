@@ -304,6 +304,71 @@ func TestLaneRestoresSnapshotAndReplaysOnlyThroughDurableCursor(t *testing.T) {
 	}
 }
 
+func TestLaneRebuildsFromAuthoritativeSeedWhenCursorBarWasCorrected(t *testing.T) {
+	key := model.SeriesKey{Dataset: "test", Symbol: "BTCUSDT", Timeframe: "1m"}
+	bars := testBars(key, 8)
+	persistence := signalstore.NewMemory()
+
+	first := mustLane(t, key, []int{2}, persistence, nil)
+	firstCtx, stopFirst := context.WithCancel(context.Background())
+	go first.Run(firstCtx)
+	if err := first.Seed(firstCtx, bars[:6]); err != nil {
+		t.Fatal(err)
+	}
+	stopFirst()
+
+	corrected := append([]model.Bar(nil), bars...)
+	corrected[5].Close += 2
+	corrected[5].High += 2
+	restarted := mustLane(t, key, []int{2}, persistence, nil)
+	restartCtx, stopRestart := context.WithCancel(context.Background())
+	defer stopRestart()
+	go restarted.Run(restartCtx)
+	if err := restarted.Seed(restartCtx, corrected); err != nil {
+		t.Fatal(err)
+	}
+
+	expectedStore := signalstore.NewMemory()
+	expected := mustLane(t, key, []int{2}, expectedStore, nil)
+	expectedCtx, stopExpected := context.WithCancel(context.Background())
+	defer stopExpected()
+	go expected.Run(expectedCtx)
+	if err := expected.Seed(expectedCtx, corrected); err != nil {
+		t.Fatal(err)
+	}
+	assertSnapshotEqual(t, expected.Snapshot(), restarted.Snapshot())
+}
+
+func TestInitializedLaneRebuildsWhenReconnectSeedCorrectsCurrentBar(t *testing.T) {
+	key := model.SeriesKey{Dataset: "test", Symbol: "BTCUSDT", Timeframe: "1m"}
+	bars := testBars(key, 8)
+	persistence := signalstore.NewMemory()
+	lane := mustLane(t, key, []int{2}, persistence, nil)
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	go lane.Run(ctx)
+	if err := lane.Seed(ctx, bars); err != nil {
+		t.Fatal(err)
+	}
+
+	corrected := append([]model.Bar(nil), bars...)
+	corrected[len(corrected)-1].Close += 2
+	corrected[len(corrected)-1].High += 2
+	if err := lane.Seed(ctx, corrected); err != nil {
+		t.Fatal(err)
+	}
+
+	expectedStore := signalstore.NewMemory()
+	expected := mustLane(t, key, []int{2}, expectedStore, nil)
+	expectedCtx, stopExpected := context.WithCancel(context.Background())
+	defer stopExpected()
+	go expected.Run(expectedCtx)
+	if err := expected.Seed(expectedCtx, corrected); err != nil {
+		t.Fatal(err)
+	}
+	assertSnapshotEqual(t, expected.Snapshot(), lane.Snapshot())
+}
+
 func TestLaneDoesNotAdvanceOnStoreFailure(t *testing.T) {
 	key := model.SeriesKey{Dataset: "test", Symbol: "BTCUSDT", Timeframe: "1m"}
 	store := &memoryStore{failCommit: true}
