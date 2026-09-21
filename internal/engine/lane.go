@@ -21,7 +21,7 @@ const marketHistoryLimit = 500
 
 type Store interface {
 	LoadRecovery(context.Context, model.SeriesKey) (model.SeriesRecovery, error)
-	RebuildSeries(context.Context, model.SeriesKey, []model.SignalEvent, []model.ReducerSnapshot, *model.Bar) error
+	RebuildSeries(context.Context, model.SeriesKey, []model.SignalEvent, []model.ReducerSnapshot, *model.Bar) ([]model.SignalEvent, error)
 	CommitClosed(context.Context, model.SeriesKey, model.Bar, []model.SignalEvent, []model.ReducerSnapshot) ([]model.SignalEvent, error)
 	MarkPublished(context.Context, []int64) error
 }
@@ -37,6 +37,7 @@ type LaneOptions struct {
 	SnapshotEvery  uint64
 	Store          Store
 	Publisher      Publisher
+	LivePublisher  Publisher
 	OutboxDelivery bool
 }
 
@@ -47,6 +48,7 @@ type Lane struct {
 	snapshotEvery  uint64
 	store          Store
 	publisher      Publisher
+	livePublisher  Publisher
 	outboxDelivery bool
 
 	mu                 sync.RWMutex
@@ -57,6 +59,7 @@ type Lane struct {
 	closedCount        uint64
 	provisional        map[int]float64
 	formingTime        *time.Time
+	formingBar         *model.Bar
 	formingRevision    uint64
 	lastErr            error
 }
@@ -117,6 +120,7 @@ func NewLane(options LaneOptions) (*Lane, error) {
 		snapshotEvery:  options.SnapshotEvery,
 		store:          options.Store,
 		publisher:      options.Publisher,
+		livePublisher:  options.LivePublisher,
 		outboxDelivery: options.OutboxDelivery,
 		reducers:       reducers,
 		market:         market,
@@ -177,7 +181,7 @@ func (l *Lane) submit(ctx context.Context, cmd command) error {
 func (l *Lane) Snapshot() model.SeriesSnapshot {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	return makeSeriesSnapshot(l.key, l.periods, l.reducers, l.market, l.lastBar, l.lastClosedRevision, l.formingTime, l.formingRevision, l.provisional)
+	return makeSeriesSnapshot(l.key, l.periods, l.reducers, l.market, l.lastBar, l.lastClosedRevision, l.formingBar, l.formingTime, l.formingRevision, l.provisional)
 }
 
 func (l *Lane) LastError() error {
@@ -192,11 +196,18 @@ func (l *Lane) applySeed(ctx context.Context, bars []model.Bar) error {
 	initialized := l.lastBar != nil
 	l.mu.RUnlock()
 	if initialized {
+		if l.seedConflictsWithHistory(bars) {
+			// A repair may insert or correct a bar behind the live cursor. Rebuild
+			// every reducer from the authoritative OHLC seed before accepting more
+			// live input; otherwise EMA, streak, FVG and OB state would remain based
+			// on a permanently incomplete history.
+			return l.rebuildSeed(ctx, bars, true)
+		}
 		if err := l.applyCatchUpSeed(ctx, bars); err != nil {
 			// Reconnect seeds are authoritative too. Reconciliation may have
 			// corrected the current durable bar while this lane remained alive;
 			// rebuild instead of rejecting the same corrected seed forever.
-			return l.rebuildSeed(ctx, bars)
+			return l.rebuildSeed(ctx, bars, true)
 		}
 		return nil
 	}
@@ -209,14 +220,63 @@ func (l *Lane) applySeed(ctx context.Context, bars []model.Bar) error {
 			// OHLC is authoritative. A corrected candle or a changed reducer set
 			// invalidates the saved checkpoint, so rebuild deterministically from
 			// the complete seed instead of reconnecting forever.
-			return l.rebuildSeed(ctx, bars)
+			return l.rebuildSeed(ctx, bars, true)
 		}
 		return l.applyCatchUpSeed(ctx, bars)
 	}
-	return l.rebuildSeed(ctx, bars)
+	return l.rebuildSeed(ctx, bars, false)
 }
 
-func (l *Lane) rebuildSeed(ctx context.Context, bars []model.Bar) error {
+// seedConflictsWithHistory reports a changed or newly inserted candle in the
+// overlap between the reducer's bounded history and an authoritative reconnect
+// seed. New bars after the cursor are normal catch-up and are not conflicts.
+func (l *Lane) seedConflictsWithHistory(bars []model.Bar) bool {
+	l.mu.RLock()
+	lastBar := cloneBar(l.lastBar)
+	localBars := l.market.Bars()
+	l.mu.RUnlock()
+	if lastBar == nil || len(localBars) == 0 {
+		return false
+	}
+
+	local := make(map[int64]string, len(localBars))
+	for _, bar := range localBars {
+		local[bar.OpenTime.UTC().UnixNano()] = barFingerprint(bar)
+	}
+	seed := make(map[int64]string, len(bars))
+	var seedFirst time.Time
+	for _, bar := range bars {
+		if !bar.Closed || bar.OpenTime.After(lastBar.OpenTime) {
+			continue
+		}
+		if seedFirst.IsZero() || bar.OpenTime.Before(seedFirst) {
+			seedFirst = bar.OpenTime
+		}
+		seed[bar.OpenTime.UTC().UnixNano()] = barFingerprint(bar)
+	}
+	if seedFirst.IsZero() {
+		return false
+	}
+
+	for timestamp, fingerprint := range seed {
+		if existing, ok := local[timestamp]; ok && existing != fingerprint {
+			return true
+		} else if !ok && timestamp >= localBars[0].OpenTime.UTC().UnixNano() {
+			return true
+		}
+	}
+	for _, bar := range localBars {
+		if bar.OpenTime.Before(seedFirst) || bar.OpenTime.After(lastBar.OpenTime) {
+			continue
+		}
+		if _, ok := seed[bar.OpenTime.UTC().UnixNano()]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *Lane) rebuildSeed(ctx context.Context, bars []model.Bar, publishReset bool) error {
 	reducers, err := newReducers(l.periods)
 	if err != nil {
 		return err
@@ -253,14 +313,39 @@ func (l *Lane) rebuildSeed(ctx context.Context, bars []model.Bar) error {
 		closedCount++
 	}
 	if lastBar != nil {
-		points = append(points, newMarketEvent(l.key, *lastBar, market.State(), revisionForBar(*lastBar)))
+		marketEvent := newMarketEvent(l.key, *lastBar, market.State(), revisionForBar(*lastBar), reducers)
+		if publishReset {
+			marketEvent.Reset = true
+			confirmed := make([]model.Bar, 0, len(bars))
+			for _, candidate := range bars {
+				if candidate.Closed && candidate.OpenTime.Before(lastBar.OpenTime) {
+					confirmed = append(confirmed, candidate)
+				}
+			}
+			if len(confirmed) > marketHistoryLimit {
+				confirmed = confirmed[len(confirmed)-marketHistoryLimit:]
+			}
+			marketEvent.ResetHistory = append([]model.Bar(nil), confirmed...)
+			resetID := sha256.Sum256([]byte(marketEvent.EventID + "\x00authoritative-reset"))
+			marketEvent.EventID = hex.EncodeToString(resetID[:])
+		}
+		points = append(points, marketEvent)
 	}
 	snapshots, err := reducerSnapshots(l.key, reducers, market, lastBar)
 	if err != nil {
 		return err
 	}
-	if err := l.store.RebuildSeries(ctx, l.key, points, snapshots, lastBar); err != nil {
+	committed, err := l.store.RebuildSeries(ctx, l.key, points, snapshots, lastBar)
+	if err != nil {
 		return fmt.Errorf("persist rebuilt series: %w", err)
+	}
+	// Publish the reset before Seed returns, so a subsequent forming frame
+	// cannot overtake it. The durable outbox republishes it after a crash; the
+	// broker and Alerts inbox make that duplicate harmless.
+	if l.livePublisher != nil {
+		for _, event := range committed {
+			l.livePublisher.Publish(event)
+		}
 	}
 
 	l.mu.Lock()
@@ -273,6 +358,7 @@ func (l *Lane) rebuildSeed(ctx context.Context, bars []model.Bar) error {
 	l.closedCount = closedCount
 	l.provisional = make(map[int]float64)
 	l.formingTime = nil
+	l.formingBar = nil
 	l.formingRevision = 0
 	l.mu.Unlock()
 	return nil
@@ -383,6 +469,7 @@ func (l *Lane) restoreRecoverySeed(recovery model.SeriesRecovery, bars []model.B
 	l.closedCount = closedCount
 	l.provisional = make(map[int]float64)
 	l.formingTime = nil
+	l.formingBar = nil
 	l.formingRevision = 0
 	l.mu.Unlock()
 	return nil
@@ -435,6 +522,17 @@ func (l *Lane) applyClosed(ctx context.Context, bar model.Bar) error {
 		}
 		return fmt.Errorf("closed bar %s is older than current cursor %s; reseed required", bar.OpenTime, lastBar.OpenTime)
 	}
+	if lastBar != nil {
+		step, err := model.TimeframeDuration(l.key.Timeframe)
+		if err != nil {
+			return err
+		}
+		expected := lastBar.OpenTime.Add(step)
+		if !bar.OpenTime.Equal(expected) {
+			return fmt.Errorf("closed bar gap: expected %s after cursor, received %s; reseed required",
+				expected.UTC(), bar.OpenTime.UTC())
+		}
+	}
 
 	revision := revisionForBar(bar)
 	events, err := reduceEMAClosed(l.key, reducers, bar, revision)
@@ -442,7 +540,7 @@ func (l *Lane) applyClosed(ctx context.Context, bar model.Bar) error {
 		return err
 	}
 	marketState := market.OnClosed(bar)
-	events = append(events, newMarketEvent(l.key, bar, marketState, revision))
+	events = append(events, newMarketEvent(l.key, bar, marketState, revision, reducers))
 	closedCount++
 	var snapshots []model.ReducerSnapshot
 	if closedCount%l.snapshotEvery == 0 {
@@ -455,6 +553,15 @@ func (l *Lane) applyClosed(ctx context.Context, bar model.Bar) error {
 	if err != nil {
 		return fmt.Errorf("commit closed bar: %w", err)
 	}
+	// The short-retention live stream carries confirmed and provisional frames
+	// in lane order. The durable outbox still owns eventual confirmed delivery.
+	if l.livePublisher != nil {
+		for _, event := range committed {
+			if event.EventType == "market.state" {
+				l.livePublisher.Publish(event)
+			}
+		}
+	}
 
 	l.mu.Lock()
 	l.reducers = reducers
@@ -464,6 +571,7 @@ func (l *Lane) applyClosed(ctx context.Context, bar model.Bar) error {
 	l.closedCount = closedCount
 	l.provisional = make(map[int]float64)
 	l.formingTime = nil
+	l.formingBar = nil
 	l.formingRevision = 0
 	l.mu.Unlock()
 	if l.publisher != nil && !l.outboxDelivery {
@@ -489,6 +597,7 @@ func (l *Lane) applyForming(bar model.Bar) error {
 	l.mu.RLock()
 	reducers, err := cloneReducers(l.periods, l.reducers)
 	lastBar := cloneBar(l.lastBar)
+	marketState := l.market.State()
 	l.mu.RUnlock()
 	if err != nil {
 		return err
@@ -512,10 +621,32 @@ func (l *Lane) applyForming(bar model.Bar) error {
 			l.publisher.Publish(newEMAEvent(l.key, bar, period, reducers[period].Samples()+1, value, true, revision))
 		}
 	}
+	if l.livePublisher != nil {
+		// Provisional facts describe the forming candle but reuse the last
+		// confirmed market structure. Occurrence-only fields are cleared so a
+		// closed-bar pattern/zone transition cannot be replayed on every tick.
+		marketState.PatternOccurrences = nil
+		marketState.ZoneTransitions = nil
+		event := newMarketEvent(l.key, bar, marketState, revision, reducers)
+		event.Provisional = true
+		for index := range event.Indicators {
+			value, ready := provisional[event.Indicators[index].Period]
+			event.Indicators[index].Ready = ready
+			event.Indicators[index].Samples++
+			if ready {
+				valueCopy := value
+				event.Indicators[index].Value = &valueCopy
+			} else {
+				event.Indicators[index].Value = nil
+			}
+		}
+		l.livePublisher.Publish(event)
+	}
 	l.mu.Lock()
 	l.provisional = provisional
 	formingTimestamp := bar.OpenTime.UTC()
 	l.formingTime = &formingTimestamp
+	l.formingBar = cloneBar(&bar)
 	l.formingRevision = revision
 	l.mu.Unlock()
 	return nil
@@ -609,6 +740,7 @@ func newEMAEvent(key model.SeriesKey, bar model.Bar, period int, samples uint64,
 		Symbol:           key.Symbol,
 		Timeframe:        key.Timeframe,
 		BarOpenTime:      bar.OpenTime.UTC(),
+		SourceBar:        cloneBar(&bar),
 		BarRevision:      revision,
 		AnalysisRevision: revision,
 		Provisional:      provisional,
@@ -622,18 +754,41 @@ func newEMAEvent(key model.SeriesKey, bar model.Bar, period int, samples uint64,
 	}
 }
 
-func newMarketEvent(key model.SeriesKey, bar model.Bar, state model.MarketState, revision uint64) model.SignalEvent {
-	algorithm := state.Algorithm
+func newMarketEvent(key model.SeriesKey, bar model.Bar, state model.MarketState, revision uint64, reducers map[int]*indicator.EMA) model.SignalEvent {
+	periods := make([]int, 0, len(reducers))
+	for period := range reducers {
+		periods = append(periods, period)
+	}
+	sort.Ints(periods)
+	algorithm := marketFactsAlgorithm(state.Algorithm, periods)
 	identity := key.String() + "|" + bar.OpenTime.UTC().Format(time.RFC3339Nano) + "|" +
 		algorithm.Name + "|" + algorithm.Version + "|" + algorithm.ConfigHash + "|false|" + strconv.FormatUint(revision, 10)
 	sum := sha256.Sum256([]byte(identity))
 	stateCopy := state
+	indicators := make([]model.IndicatorState, 0, len(periods))
+	for _, period := range periods {
+		value, ready := reducers[period].Value()
+		item := model.IndicatorState{Algorithm: emaAlgorithm(period), Period: period, Samples: reducers[period].Samples(), Ready: ready, AnalysisRevision: revision}
+		if ready {
+			item.Value = &value
+		}
+		indicators = append(indicators, item)
+	}
 	return model.SignalEvent{
 		Schema: signalSchema, EventID: hex.EncodeToString(sum[:]), EventType: "market.state",
 		Dataset: key.Dataset, Symbol: key.Symbol, Timeframe: key.Timeframe,
 		BarOpenTime: bar.OpenTime.UTC(), BarRevision: revision, AnalysisRevision: revision,
-		Algorithm: algorithm, Market: &stateCopy,
+		SourceBar: cloneBar(&bar), Algorithm: algorithm, Market: &stateCopy, Indicators: indicators,
 	}
+}
+
+func marketFactsAlgorithm(base model.AlgorithmRef, periods []int) model.AlgorithmRef {
+	identity := base.ConfigHash
+	for _, period := range periods {
+		identity += "|" + emaAlgorithm(period).ConfigHash
+	}
+	sum := sha256.Sum256([]byte(identity))
+	return model.AlgorithmRef{Name: base.Name, Version: base.Version, ConfigHash: "sha256:" + hex.EncodeToString(sum[:])}
 }
 
 func emaAlgorithm(period int) model.AlgorithmRef {
@@ -670,16 +825,18 @@ func reducerSnapshots(key model.SeriesKey, reducers map[int]*indicator.EMA, mark
 	return out, nil
 }
 
-func makeSeriesSnapshot(key model.SeriesKey, periods []int, reducers map[int]*indicator.EMA, market *indicator.Market, lastBar *model.Bar, lastClosedRevision uint64, formingTime *time.Time, formingRevision uint64, provisional map[int]float64) model.SeriesSnapshot {
+func makeSeriesSnapshot(key model.SeriesKey, periods []int, reducers map[int]*indicator.EMA, market *indicator.Market, lastBar *model.Bar, lastClosedRevision uint64, formingBar *model.Bar, formingTime *time.Time, formingRevision uint64, provisional map[int]float64) model.SeriesSnapshot {
 	snapshot := model.SeriesSnapshot{Schema: "signal.snapshot.v1", Series: key, Ready: true,
 		LastClosedRevision: lastClosedRevision, FormingRevision: formingRevision}
 	if lastBar != nil {
 		timestamp := lastBar.OpenTime.UTC()
 		snapshot.LastClosedTime = &timestamp
+		snapshot.LastClosedBar = cloneBar(lastBar)
 	}
 	if formingTime != nil {
 		timestamp := formingTime.UTC()
 		snapshot.FormingOpenTime = &timestamp
+		snapshot.FormingBar = cloneBar(formingBar)
 	}
 	for _, period := range periods {
 		reducer := reducers[period]

@@ -154,19 +154,28 @@ func (s *Postgres) LoadRecovery(ctx context.Context, key model.SeriesKey) (model
 	return recovery, nil
 }
 
-func (s *Postgres) RebuildSeries(ctx context.Context, key model.SeriesKey, events []model.SignalEvent, snapshots []model.ReducerSnapshot, lastBar *model.Bar) error {
+func (s *Postgres) RebuildSeries(ctx context.Context, key model.SeriesKey, events []model.SignalEvent, snapshots []model.ReducerSnapshot, lastBar *model.Bar) ([]model.SignalEvent, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	for _, event := range events {
+		if event.Reset {
+			// Keep the global outbox/series lock order identical to CommitClosed.
+			if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", outboxAdvisoryLock); err != nil {
+				return nil, fmt.Errorf("lock signal outbox ordering: %w", err)
+			}
+			break
+		}
+	}
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", advisoryKey(key)); err != nil {
-		return fmt.Errorf("lock series rebuild: %w", err)
+		return nil, fmt.Errorf("lock series rebuild: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM signal_reducer_snapshots
 		WHERE dataset=$1 AND symbol=$2 AND timeframe=$3`,
 		key.Dataset, key.Symbol, key.Timeframe); err != nil {
-		return fmt.Errorf("clear stale reducer snapshots: %w", err)
+		return nil, fmt.Errorf("clear stale reducer snapshots: %w", err)
 	}
 	// Rebuild output is authoritative for this series. Remove points generated
 	// from a superseded OHLC seed so lower revision numbers from a historical
@@ -174,24 +183,43 @@ func (s *Postgres) RebuildSeries(ctx context.Context, key model.SeriesKey, event
 	if _, err := tx.Exec(ctx, `DELETE FROM signal_indicator_points
 		WHERE dataset=$1 AND symbol=$2 AND timeframe=$3`,
 		key.Dataset, key.Symbol, key.Timeframe); err != nil {
-		return fmt.Errorf("clear stale indicator points: %w", err)
+		return nil, fmt.Errorf("clear stale indicator points: %w", err)
 	}
+	committed := make([]model.SignalEvent, 0, 1)
 	for _, event := range events {
 		if err := persistEventState(ctx, tx, event); err != nil {
-			return err
+			return nil, err
+		}
+		if event.Reset {
+			payload, marshalErr := json.Marshal(event)
+			if marshalErr != nil {
+				return nil, fmt.Errorf("encode reset event: %w", marshalErr)
+			}
+			var cursor int64
+			if err := tx.QueryRow(ctx, `INSERT INTO signal_event_outbox
+				(event_id,dataset,symbol,timeframe,period,event_type,payload) VALUES ($1,$2,$3,$4,0,$5,$6)
+				ON CONFLICT (event_id) DO UPDATE SET event_id=EXCLUDED.event_id RETURNING cursor`,
+				event.EventID, event.Dataset, event.Symbol, event.Timeframe, event.EventType, payload).Scan(&cursor); err != nil {
+				return nil, fmt.Errorf("insert reset outbox: %w", err)
+			}
+			event.Cursor = cursor
+			committed = append(committed, event)
 		}
 	}
 	for _, snapshot := range snapshots {
 		if err := upsertSnapshot(ctx, tx, key, snapshot); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if lastBar != nil {
 		if err := upsertCursor(ctx, tx, key, *lastBar); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return committed, nil
 }
 
 func (s *Postgres) CommitClosed(ctx context.Context, key model.SeriesKey, bar model.Bar, events []model.SignalEvent, snapshots []model.ReducerSnapshot) ([]model.SignalEvent, error) {

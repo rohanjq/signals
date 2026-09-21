@@ -51,12 +51,12 @@ func (s *Memory) LoadRecovery(_ context.Context, key model.SeriesKey) (model.Ser
 	return recovery, nil
 }
 
-func (s *Memory) RebuildSeries(_ context.Context, key model.SeriesKey, events []model.SignalEvent, snapshots []model.ReducerSnapshot, lastBar *model.Bar) error {
+func (s *Memory) RebuildSeries(_ context.Context, key model.SeriesKey, events []model.SignalEvent, snapshots []model.ReducerSnapshot, lastBar *model.Bar) ([]model.SignalEvent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if lastBar != nil {
 		if current, ok := s.cursors[key.String()]; ok && current.OpenTime.After(lastBar.OpenTime) {
-			return fmt.Errorf("rebuilt series cursor would move backwards")
+			return nil, fmt.Errorf("rebuilt series cursor would move backwards")
 		}
 	}
 	for storageKey := range s.snapshots {
@@ -69,8 +69,16 @@ func (s *Memory) RebuildSeries(_ context.Context, key model.SeriesKey, events []
 			delete(s.points, eventID)
 		}
 	}
+	committed := make([]model.SignalEvent, 0, 1)
 	for _, event := range events {
 		s.persistEventState(event)
+		if event.Reset {
+			s.next++
+			event.Cursor = s.next
+			s.events = append(s.events, event)
+			s.published[event.Cursor] = false
+			committed = append(committed, event)
+		}
 	}
 	for _, snapshot := range snapshots {
 		s.snapshots[snapshotKey(key, snapshot)] = snapshot
@@ -78,7 +86,7 @@ func (s *Memory) RebuildSeries(_ context.Context, key model.SeriesKey, events []
 	if lastBar != nil {
 		s.cursors[key.String()] = *lastBar
 	}
-	return nil
+	return committed, nil
 }
 
 func (s *Memory) CommitClosed(_ context.Context, key model.SeriesKey, bar model.Bar, events []model.SignalEvent, snapshots []model.ReducerSnapshot) ([]model.SignalEvent, error) {

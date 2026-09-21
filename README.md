@@ -23,6 +23,10 @@ normalized into typed Signals V1 outputs at the public API boundary.
 - Forming-bar values are provisional projections and never mutate canonical state.
 - A closed bar's points, cursor, snapshots, and outbox rows commit atomically.
 - In-memory state advances only after the durable transaction commits.
+- Confirmed complete fact frames are published from the transactional outbox
+  to JetStream and acknowledged by the broker before the outbox row completes.
+- Complete forming frames are coalesced to one per second (colour transitions
+  bypass the throttle) in a separate two-hour JetStream for intrabar rules.
 - Event delivery is at least once; consumers deduplicate by `event_id`.
 - WebSocket startup subscribes before snapshot/replay and removes cursor duplicates.
 - One bounded mailbox per series applies backpressure instead of dropping bars.
@@ -41,8 +45,8 @@ curl -H "Authorization: Bearer $SIGNALD_API_TOKEN" \
     http://127.0.0.1:8090/v1/catalog
 ```
 
-PostgreSQL binds to `127.0.0.1:5433`; the API binds to
-`127.0.0.1:8090`. Schema migration is automatic and serialized with a
+PostgreSQL binds to `127.0.0.1:5433`, NATS to `127.0.0.1:4222` (monitoring on
+`127.0.0.1:8222`), and the API to `127.0.0.1:8090`. Schema migration is automatic and serialized with a
 PostgreSQL advisory lock. `/readyz` returns 200 only when PostgreSQL, OHLC, and
 all configured reducer lanes are ready.
 
@@ -90,7 +94,7 @@ WebSocket clients send one subscription after connecting:
   "type": "subscribe",
   "request_id": "8cf6e2e4-...",
   "data": {
-    "series": [{"dataset": "binance-spot", "symbol": "BTCUSDT", "timeframe": "1m"}],
+    "series": [{"dataset": "live", "symbol": "BTCUSDT", "timeframe": "1m"}],
     "analyses": [{"name": "*"}],
     "event_types": ["io.ytstack.signals.analysis.updated.v1"],
     "statuses": ["confirmed", "provisional"],
@@ -114,13 +118,17 @@ CloudEvents-compatible analysis schema. Cursors are opaque decimal strings.
 
 Slow WebSocket clients are disconnected when their bounded buffer fills. They
 must reconnect with the last durable cursor they processed; provisional events
-are intentionally not replayed.
+are intentionally not replayed by the public WebSocket. Backend alert engines
+consume the ordered `MARKET_EVALUATION` JetStream instead. Confirmed frames,
+provisional transitions, and coalesced snapshots share one per-partition
+broker sequence.
 
 ## Configuration
 
 See [`.env.example`](.env.example). Production requires
-`SIGNALD_API_TOKEN` and `SIGNALD_DATABASE_URL`; startup fails closed when either
-is absent. `SIGNALD_SEED_BARS` must be at least the largest configured EMA
+`SIGNALD_API_TOKEN`, `SIGNALD_DATABASE_URL`, and, when event forwarding is
+enabled, a 32+ character `SIGNALD_NATS_TOKEN`; startup fails closed when a
+required value is absent. `SIGNALD_SEED_BARS` must be at least the largest configured EMA
 period. Keep PostgreSQL private, use a TLS database URL, terminate HTTPS/WSS at
 the ingress, and restrict `SIGNALD_ALLOWED_ORIGINS` to actual consumers.
 
@@ -133,5 +141,7 @@ make vet
 make build
 ```
 
-The broader component boundaries and staged JetStream migration are documented
-in [`../MARKET_INTELLIGENCE_DESIGN.md`](../MARKET_INTELLIGENCE_DESIGN.md).
+The component boundaries are documented in
+[`../MARKET_INTELLIGENCE_DESIGN.md`](../MARKET_INTELLIGENCE_DESIGN.md), and the
+implemented broker handoff is documented in
+[`../alerts/docs/broker.md`](../alerts/docs/broker.md).

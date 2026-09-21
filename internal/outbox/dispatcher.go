@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/rohanjq/signals/internal/engine"
 	"github.com/rohanjq/signals/internal/model"
 	"github.com/rohanjq/signals/internal/monitor"
 )
@@ -15,15 +14,19 @@ type Store interface {
 	MarkPublished(context.Context, []int64) error
 }
 
+type Publisher interface {
+	Publish(context.Context, model.SignalEvent) error
+}
+
 type Dispatcher struct {
 	store     Store
-	publisher engine.Publisher
+	publisher Publisher
 	interval  time.Duration
 	logger    *slog.Logger
 	metrics   *monitor.Metrics
 }
 
-func New(store Store, publisher engine.Publisher, interval time.Duration, logger *slog.Logger, metrics *monitor.Metrics) *Dispatcher {
+func New(store Store, publisher Publisher, interval time.Duration, logger *slog.Logger, metrics *monitor.Metrics) *Dispatcher {
 	if interval <= 0 {
 		interval = 250 * time.Millisecond
 	}
@@ -34,7 +37,7 @@ func New(store Store, publisher engine.Publisher, interval time.Duration, logger
 }
 
 func (d *Dispatcher) Run(ctx context.Context) error {
-	if err := d.flush(ctx); err != nil {
+	if err := d.Flush(ctx); err != nil {
 		d.recordFailure()
 		d.logger.Warn("initial outbox recovery failed", "err", err)
 	} else {
@@ -47,7 +50,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if err := d.flush(ctx); err != nil {
+			if err := d.Flush(ctx); err != nil {
 				d.recordFailure()
 				d.logger.Warn("outbox recovery failed", "err", err)
 			} else {
@@ -70,7 +73,9 @@ func (d *Dispatcher) recordFailure() {
 	}
 }
 
-func (d *Dispatcher) flush(ctx context.Context) error {
+// Flush publishes all committed pending events. It is exported so startup can
+// establish the evaluation-stream ordering barrier before live OHLC resumes.
+func (d *Dispatcher) Flush(ctx context.Context) error {
 	for {
 		events, err := d.store.PendingEvents(ctx, 250)
 		if err != nil {
@@ -81,7 +86,9 @@ func (d *Dispatcher) flush(ctx context.Context) error {
 		}
 		cursors := make([]int64, 0, len(events))
 		for _, event := range events {
-			d.publisher.Publish(event)
+			if err := d.publisher.Publish(ctx, event); err != nil {
+				return err
+			}
 			cursors = append(cursors, event.Cursor)
 		}
 		if err := d.store.MarkPublished(ctx, cursors); err != nil {

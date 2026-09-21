@@ -11,6 +11,13 @@ type PriceZone struct {
 	ToTime   time.Time `json:"to_time"`
 	Top      float64   `json:"top"`
 	Bottom   float64   `json:"bottom"`
+	State    string    `json:"state,omitempty"`
+}
+
+type ZoneTransition struct {
+	Zone       PriceZone `json:"zone"`
+	Transition string    `json:"transition"`
+	At         time.Time `json:"at"`
 }
 
 type Swing struct {
@@ -54,18 +61,20 @@ type PremiumDiscount struct {
 }
 
 type MarketState struct {
-	Schema          string           `json:"schema"`
-	Algorithm       AlgorithmRef     `json:"algorithm"`
-	AsOf            time.Time        `json:"as_of"`
-	Trend           string           `json:"trend"`
-	Swings          []Swing          `json:"swings"`
-	Structure       []StructureEvent `json:"structure"`
-	Ranges          []PriceZone      `json:"ranges"`
-	KeyLevels       []PriceLevel     `json:"key_levels"`
-	FVGs            []PriceZone      `json:"fvgs"`
-	OrderBlocks     []PriceZone      `json:"order_blocks"`
-	Liquidity       []PriceLevel     `json:"liquidity"`
-	LiquiditySweeps []PatternEvent   `json:"liquidity_sweeps"`
-	Patterns        []PatternEvent   `json:"patterns"`
-	PremiumDiscount *PremiumDiscount `json:"premium_discount,omitempty"`
+	Schema             string           `json:"schema"`
+	Algorithm          AlgorithmRef     `json:"algorithm"`
+	AsOf               time.Time        `json:"as_of"`
+	Trend              string           `json:"trend"`
+	Swings             []Swing          `json:"swings"`
+	Structure          []StructureEvent `json:"structure"`
+	Ranges             []PriceZone      `json:"ranges"`
+	KeyLevels          []PriceLevel     `json:"key_levels"`
+	FVGs               []PriceZone      `json:"fvgs"`
+	OrderBlocks        []PriceZone      `json:"order_blocks"`
+	Liquidity          []PriceLevel     `json:"liquidity"`
+	LiquiditySweeps    []PatternEvent   `json:"liquidity_sweeps"`
+	Patterns           []PatternEvent   `json:"patterns"`
+	PatternOccurrences []PatternEvent   `json:"pattern_occurrences"`
+	ZoneTransitions    []ZoneTransition `json:"zone_transitions"`
+	PremiumDiscount    *PremiumDiscount `json:"premium_discount,omitempty"`
 }

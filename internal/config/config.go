@@ -30,6 +30,9 @@ type Config struct {
 	AllowedOrigins     []string
 	ShutdownTimeout    time.Duration
 	OutboxPollInterval time.Duration
+	NATSURL            string
+	NATSToken          string
+	NATSReplicas       int
 	LogLevel           slog.Level
 }
 
@@ -46,6 +49,8 @@ func load(lookup lookupFunc) (Config, error) {
 	config.Dataset = valueOr(lookup, "SIGNALD_DATASET", "live")
 	config.APIAuthToken = valueOr(lookup, "SIGNALD_API_TOKEN", "")
 	config.AllowedOrigins = splitNonEmpty(valueOr(lookup, "SIGNALD_ALLOWED_ORIGINS", "http://127.0.0.1:8080,http://localhost:8080,http://127.0.0.1:8082,http://localhost:8082,http://127.0.0.1:18110,http://localhost:18110"))
+	config.NATSURL = valueOr(lookup, "SIGNALD_NATS_URL", "")
+	config.NATSToken = valueOr(lookup, "SIGNALD_NATS_TOKEN", "")
 
 	var err error
 	config.DatabaseMaxConns, err = intValue(lookup, "SIGNALD_DATABASE_MAX_CONNS", 10, 1, 100)
@@ -81,6 +86,10 @@ func load(lookup lookupFunc) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	config.NATSReplicas, err = intValue(lookup, "SIGNALD_NATS_REPLICAS", 1, 1, 5)
+	if err != nil {
+		return Config{}, err
+	}
 
 	config.Periods, err = parsePeriods(valueOr(lookup, "SIGNALD_EMA_PERIODS", "9,21,50,200"))
 	if err != nil {
@@ -104,6 +113,9 @@ func load(lookup lookupFunc) (Config, error) {
 	}
 	if len(config.AllowedOrigins) == 0 {
 		return Config{}, fmt.Errorf("SIGNALD_ALLOWED_ORIGINS cannot be empty")
+	}
+	if config.NATSURL != "" && len(config.NATSToken) < 32 {
+		return Config{}, fmt.Errorf("SIGNALD_NATS_TOKEN must contain at least 32 characters when SIGNALD_NATS_URL is set")
 	}
 
 	switch strings.ToLower(valueOr(lookup, "SIGNALD_LOG_LEVEL", "info")) {

@@ -51,6 +51,37 @@ func TestEvaluateMarketFindsPatterns(t *testing.T) {
 	}
 }
 
+func TestMarketEmitsZoneLifecycleTransitions(t *testing.T) {
+	start := time.Unix(1_700_000_000, 0).UTC()
+	market, err := NewMarket(DefaultMarketConfig(), 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	market.OnClosed(marketBar(start, 100, 101, 98, 99))
+	market.OnClosed(marketBar(start.Add(time.Minute), 99, 110, 99, 109))
+	created := market.OnClosed(marketBar(start.Add(2*time.Minute), 112, 114, 111, 113))
+	if !hasZoneTransition(created.ZoneTransitions, "fvg", "created") {
+		t.Fatalf("created transitions = %+v", created.ZoneTransitions)
+	}
+	touched := market.OnClosed(marketBar(start.Add(3*time.Minute), 112, 113, 105, 110))
+	if !hasZoneTransition(touched.ZoneTransitions, "fvg", "touched") {
+		t.Fatalf("touched transitions = %+v", touched.ZoneTransitions)
+	}
+	mitigated := market.OnClosed(marketBar(start.Add(4*time.Minute), 110, 111, 100, 102))
+	if !hasZoneTransition(mitigated.ZoneTransitions, "fvg", "mitigated") {
+		t.Fatalf("mitigated transitions = %+v", mitigated.ZoneTransitions)
+	}
+}
+
+func hasZoneTransition(values []model.ZoneTransition, kind, transition string) bool {
+	for _, value := range values {
+		if value.Zone.Kind == kind && value.Transition == transition {
+			return true
+		}
+	}
+	return false
+}
+
 func TestDetectPatternsCoversLegacySet(t *testing.T) {
 	start := time.Unix(1_700_000_000, 0).UTC()
 	filler := marketBar(start, 100, 101, 99, 100)

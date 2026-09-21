@@ -28,13 +28,19 @@ func (s *memoryStore) LoadRecovery(context.Context, model.SeriesKey) (model.Seri
 	return model.SeriesRecovery{}, nil
 }
 
-func (s *memoryStore) RebuildSeries(_ context.Context, _ model.SeriesKey, events []model.SignalEvent, snapshots []model.ReducerSnapshot, _ *model.Bar) error {
+func (s *memoryStore) RebuildSeries(_ context.Context, _ model.SeriesKey, events []model.SignalEvent, snapshots []model.ReducerSnapshot, _ *model.Bar) ([]model.SignalEvent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rebuilds++
 	s.seedEvents = append([]model.SignalEvent(nil), events...)
 	s.snapshots = append([]model.ReducerSnapshot(nil), snapshots...)
-	return nil
+	committed := make([]model.SignalEvent, 0, 1)
+	for _, event := range events {
+		if event.Reset {
+			committed = append(committed, event)
+		}
+	}
+	return committed, nil
 }
 
 func (s *memoryStore) CommitClosed(_ context.Context, _ model.SeriesKey, _ model.Bar, events []model.SignalEvent, snapshots []model.ReducerSnapshot) ([]model.SignalEvent, error) {
@@ -117,6 +123,41 @@ func TestLaneLiveReplayParityAndProjection(t *testing.T) {
 	}
 	if marketEvents != 2 {
 		t.Fatalf("market events = %d, want 2", marketEvents)
+	}
+}
+
+func TestLanePublishesOrderedCompleteLiveFrames(t *testing.T) {
+	key := model.SeriesKey{Dataset: "test", Symbol: "BTCUSDT", Timeframe: "1m"}
+	store := &memoryStore{}
+	live := &capturePublisher{}
+	lane, err := NewLane(LaneOptions{Key: key, Periods: []int{2}, MailboxSize: 8, SnapshotEvery: 2,
+		Store: store, LivePublisher: live, OutboxDelivery: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go lane.Run(ctx)
+	bars := testBars(key, 4)
+	if err := lane.Seed(ctx, bars[:3]); err != nil {
+		t.Fatal(err)
+	}
+	forming := bars[3]
+	forming.Closed = false
+	if err := lane.Forming(ctx, forming); err != nil {
+		t.Fatal(err)
+	}
+	if err := lane.Closed(ctx, bars[3]); err != nil {
+		t.Fatal(err)
+	}
+	if len(live.events) != 2 {
+		t.Fatalf("live events=%d, want provisional and confirmed", len(live.events))
+	}
+	if !live.events[0].Provisional || live.events[0].EventType != "market.state" || live.events[0].SourceBar == nil || live.events[0].Market == nil {
+		t.Fatalf("first live event is not a complete provisional frame: %+v", live.events[0])
+	}
+	if live.events[1].Provisional || live.events[1].EventType != "market.state" || live.events[1].SourceBar == nil {
+		t.Fatalf("second live event is not a confirmed frame: %+v", live.events[1])
 	}
 }
 
@@ -256,6 +297,86 @@ func TestLaneReconnectSeedCatchesUpWithoutRebuildOrDuplicate(t *testing.T) {
 	snapshot := lane.Snapshot()
 	if snapshot.LastClosedTime == nil || !snapshot.LastClosedTime.Equal(bars[5].OpenTime) {
 		t.Fatalf("last closed=%v, want %v", snapshot.LastClosedTime, bars[5].OpenTime)
+	}
+}
+
+func TestLaneRejectsGapThenCatchesUpFromAuthoritativeSeed(t *testing.T) {
+	key := model.SeriesKey{Dataset: "test", Symbol: "BTCUSDT", Timeframe: "1m"}
+	store := &memoryStore{}
+	publisher := &capturePublisher{}
+	lane := mustLane(t, key, []int{2}, store, publisher)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go lane.Run(ctx)
+	bars := testBars(key, 4)
+	if err := lane.Seed(ctx, bars[:2]); err != nil {
+		t.Fatal(err)
+	}
+	if err := lane.Closed(ctx, bars[3]); err == nil {
+		t.Fatal("expected a non-contiguous closed bar to be rejected")
+	}
+	if err := lane.Seed(ctx, bars); err != nil {
+		t.Fatal(err)
+	}
+	if store.rebuilds != 1 || store.commits != 2 {
+		t.Fatalf("rebuilds=%d commits=%d, want 1 and 2", store.rebuilds, store.commits)
+	}
+	if len(publisher.events) != 4 {
+		t.Fatalf("published events=%d, want 4 from two repaired bars", len(publisher.events))
+	}
+	snapshot := lane.Snapshot()
+	if snapshot.LastClosedTime == nil || !snapshot.LastClosedTime.Equal(bars[3].OpenTime) {
+		t.Fatalf("last closed=%v, want %v", snapshot.LastClosedTime, bars[3].OpenTime)
+	}
+}
+
+func TestLaneRebuildsWhenAuthoritativeSeedInsertsBarBehindCursor(t *testing.T) {
+	key := model.SeriesKey{Dataset: "test", Symbol: "BTCUSDT", Timeframe: "1m"}
+	store := &memoryStore{}
+	lane := mustLane(t, key, []int{2}, store, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go lane.Run(ctx)
+	bars := testBars(key, 5)
+	if err := lane.Seed(ctx, append(append([]model.Bar(nil), bars[:2]...), bars[3:]...)); err != nil {
+		t.Fatal(err)
+	}
+	if err := lane.Seed(ctx, bars); err != nil {
+		t.Fatal(err)
+	}
+	if store.rebuilds != 2 {
+		t.Fatalf("rebuilds=%d, want 2 after repaired history", store.rebuilds)
+	}
+}
+
+func TestLanePublishesAuthoritativeResetAfterCorrection(t *testing.T) {
+	key := model.SeriesKey{Dataset: "test", Symbol: "BTCUSDT", Timeframe: "1m"}
+	store := &memoryStore{}
+	publisher := &capturePublisher{}
+	lane, err := NewLane(LaneOptions{Key: key, Periods: []int{2}, MailboxSize: 8, SnapshotEvery: 2, Store: store, LivePublisher: publisher, OutboxDelivery: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go lane.Run(ctx)
+	bars := testBars(key, 5)
+	if err := lane.Seed(ctx, bars); err != nil {
+		t.Fatal(err)
+	}
+	corrected := append([]model.Bar(nil), bars...)
+	corrected[2].Close++
+	corrected[2].High++
+	if err := lane.Seed(ctx, corrected); err != nil {
+		t.Fatal(err)
+	}
+	publisher.mu.Lock()
+	defer publisher.mu.Unlock()
+	if len(publisher.events) != 1 || !publisher.events[0].Reset {
+		t.Fatalf("reset events=%+v", publisher.events)
+	}
+	if got := len(publisher.events[0].ResetHistory); got != 4 {
+		t.Fatalf("reset history=%d want=4", got)
 	}
 }
 

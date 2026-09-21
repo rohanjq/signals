@@ -11,7 +11,10 @@ import (
 	"github.com/rohanjq/signals/internal/model"
 )
 
-const MarketAlgorithmVersion = "1.0.0"
+// 1.1 adds explicit zone/pattern lifecycle facts and complete EMA facts to the
+// public market event. The version bump prevents an older payload and the new
+// payload from sharing an immutable event identity in the durable outbox.
+const MarketAlgorithmVersion = "1.1.0"
 
 type MarketConfig struct {
 	MinSwingPct       float64
@@ -93,6 +96,8 @@ func EvaluateMarket(bars []model.Bar, config MarketConfig) model.MarketState {
 	state.AsOf = closed[len(closed)-1].OpenTime.UTC()
 	state.FVGs = detectFVG(closed, config.FVGLookback)
 	state.OrderBlocks = detectOrderBlocks(closed, state.FVGs)
+	annotateZoneStates(closed, state.FVGs)
+	annotateZoneStates(closed, state.OrderBlocks)
 	state.Patterns = detectPatterns(closed, config.PatternLookback)
 	state.Liquidity, state.LiquiditySweeps = detectLiquidity(closed, config.LiquidityLookback, config.LiquidityTol)
 
@@ -120,6 +125,18 @@ func EvaluateMarket(bars []model.Bar, config MarketConfig) model.MarketState {
 		state.PremiumDiscount = premiumDiscount(closed, swings, state.Trend)
 	}
 	return state
+}
+
+func annotateZoneStates(bars []model.Bar, zones []model.PriceZone) {
+	for index := range zones {
+		zones[index].State = "active"
+		for _, bar := range bars {
+			if intersectsZone(bar, zones[index]) {
+				zones[index].State = "touched"
+				break
+			}
+		}
+	}
 }
 
 func features(bar model.Bar) candleFeatures {

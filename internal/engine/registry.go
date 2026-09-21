@@ -16,6 +16,7 @@ type RegistryOptions struct {
 	SnapshotEvery  uint64
 	Store          Store
 	Publisher      Publisher
+	LivePublisher  Publisher
 	OutboxDelivery bool
 }
 
@@ -38,6 +39,7 @@ func NewRegistry(options RegistryOptions) (*Registry, error) {
 		lane, err := NewLane(LaneOptions{
 			Key: key, Periods: options.Periods, MailboxSize: options.MailboxSize,
 			SnapshotEvery: options.SnapshotEvery, Store: options.Store, Publisher: options.Publisher,
+			LivePublisher:  options.LivePublisher,
 			OutboxDelivery: options.OutboxDelivery,
 		})
 		if err != nil {

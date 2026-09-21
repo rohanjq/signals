@@ -4,7 +4,7 @@
   "title": "Signals V1 Analysis Event",
   "type": "object",
   "additionalProperties": false,
-  "required": ["specversion", "id", "source", "type", "subject", "time", "datacontenttype", "dataschema", "data"],
+  "required": ["specversion", "id", "source", "type", "subject", "time", "datacontenttype", "dataschema", "correlationid", "data"],
   "properties": {
     "specversion": {"const": "1.0"},
     "id": {"type": "string", "minLength": 1},
@@ -14,6 +14,7 @@
     "time": {"type": "string", "format": "date-time"},
     "datacontenttype": {"const": "application/json"},
     "dataschema": {"const": "urn:ytstack:signals:schema:analysis:v1"},
+    "correlationid": {"type": "string", "minLength": 1},
     "data": {"$ref": "#/$defs/analysisData"}
   },
   "$defs": {
@@ -24,6 +25,8 @@
       "properties": {
         "series": {"$ref": "#/$defs/series"},
         "bar": {"$ref": "#/$defs/bar"},
+        "reset": {"type": "boolean"},
+        "history": {"type": "array", "maxItems": 500, "items": {"$ref": "#/$defs/bar"}},
         "analysis": {"$ref": "#/$defs/analysis"},
         "analysis_revision": {"type": "integer", "minimum": 0},
         "outputs": {"type": "array", "items": {"$ref": "#/$defs/output"}},
@@ -46,12 +49,19 @@
     "bar": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["open_time", "close_time", "revision", "status"],
+      "required": ["open_time", "close_time", "revision", "status", "source_id", "open", "high", "low", "close", "volume", "trades"],
       "properties": {
         "open_time": {"type": "string", "format": "date-time"},
         "close_time": {"type": "string", "format": "date-time"},
         "revision": {"type": "integer", "minimum": 0},
-        "status": {"enum": ["confirmed", "provisional"]}
+        "status": {"enum": ["confirmed", "provisional"]},
+        "source_id": {"type": "string", "minLength": 1},
+        "open": {"type": "number"},
+        "high": {"type": "number"},
+        "low": {"type": "number"},
+        "close": {"type": "number"},
+        "volume": {"type": "number", "minimum": 0},
+        "trades": {"type": "integer", "minimum": 0}
       }
     },
     "analysis": {
@@ -133,7 +143,7 @@
         "lower": {"type": "number"},
         "label": {"type": "string"},
         "direction": {"$ref": "#/$defs/direction"},
-        "state": {"enum": ["pending", "active", "mitigated", "invalidated", "expired"]},
+        "state": {"enum": ["pending", "active", "touched", "mitigated", "invalidated", "expired"]},
         "attributes": {"$ref": "#/$defs/attributes"}
       }
     },

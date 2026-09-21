@@ -16,20 +16,27 @@ type IndicatorPayload struct {
 }
 
 type SignalEvent struct {
-	Schema           string            `json:"schema"`
-	Cursor           int64             `json:"cursor,omitempty"`
-	EventID          string            `json:"event_id"`
-	EventType        string            `json:"event_type"`
-	Dataset          string            `json:"dataset"`
-	Symbol           string            `json:"symbol"`
-	Timeframe        string            `json:"timeframe"`
-	BarOpenTime      time.Time         `json:"bar_open_time"`
-	BarRevision      uint64            `json:"bar_revision"`
-	AnalysisRevision uint64            `json:"analysis_revision"`
-	Provisional      bool              `json:"provisional"`
-	Algorithm        AlgorithmRef      `json:"algorithm"`
-	Indicator        *IndicatorPayload `json:"indicator,omitempty"`
-	Market           *MarketState      `json:"market,omitempty"`
+	Schema           string    `json:"schema"`
+	Cursor           int64     `json:"cursor,omitempty"`
+	EventID          string    `json:"event_id"`
+	EventType        string    `json:"event_type"`
+	Dataset          string    `json:"dataset"`
+	Symbol           string    `json:"symbol"`
+	Timeframe        string    `json:"timeframe"`
+	BarOpenTime      time.Time `json:"bar_open_time"`
+	SourceBar        *Bar      `json:"source_bar,omitempty"`
+	BarRevision      uint64    `json:"bar_revision"`
+	AnalysisRevision uint64    `json:"analysis_revision"`
+	Provisional      bool      `json:"provisional"`
+	// Reset marks an authoritative replacement of the reducer state after an
+	// OHLC history correction. Consumers must replace future evaluation state,
+	// but must not retract alert events that were already emitted live.
+	Reset        bool              `json:"reset,omitempty"`
+	ResetHistory []Bar             `json:"reset_history,omitempty"`
+	Algorithm    AlgorithmRef      `json:"algorithm"`
+	Indicator    *IndicatorPayload `json:"indicator,omitempty"`
+	Market       *MarketState      `json:"market,omitempty"`
+	Indicators   []IndicatorState  `json:"indicators,omitempty"`
 }
 
 type ReducerSnapshot struct {
@@ -59,8 +66,10 @@ type SeriesSnapshot struct {
 	Schema             string           `json:"schema"`
 	Series             SeriesKey        `json:"series"`
 	LastClosedTime     *time.Time       `json:"last_closed_time,omitempty"`
+	LastClosedBar      *Bar             `json:"last_closed_bar,omitempty"`
 	LastClosedRevision uint64           `json:"last_closed_revision"`
 	FormingOpenTime    *time.Time       `json:"forming_open_time,omitempty"`
+	FormingBar         *Bar             `json:"forming_bar,omitempty"`
 	FormingRevision    uint64           `json:"forming_revision"`
 	Ready              bool             `json:"ready"`
 	Indicators         []IndicatorState `json:"indicators"`

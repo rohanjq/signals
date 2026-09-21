@@ -51,7 +51,7 @@ func TestMemoryRecentPointsIncludesSeedAndReturnsNewestAscending(t *testing.T) {
 		Algorithm:   model.AlgorithmRef{Name: "ema", Version: "0", ConfigHash: "stale"},
 		Indicator:   &model.IndicatorPayload{Period: 9, Ready: true},
 	})
-	if err := persistence.RebuildSeries(ctx, key, events, nil, nil); err != nil {
+	if _, err := persistence.RebuildSeries(ctx, key, events, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	points, err := persistence.QueryRecentPoints(ctx, PointFilter{

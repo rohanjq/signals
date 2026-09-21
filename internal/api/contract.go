@@ -6,9 +6,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
+	"github.com/rohanjq/signals/internal/indicator"
 	"github.com/rohanjq/signals/internal/model"
 )
 
@@ -45,11 +47,14 @@ type analysisEvent struct {
 	DataContentType string       `json:"datacontenttype"`
 	DataSchema      string       `json:"dataschema"`
 	Data            analysisData `json:"data"`
+	CorrelationID   string       `json:"correlationid"`
 }
 
 type analysisData struct {
 	Series           model.SeriesKey   `json:"series"`
 	Bar              analysisBar       `json:"bar"`
+	Reset            bool              `json:"reset,omitempty"`
+	History          []analysisBar     `json:"history,omitempty"`
 	Analysis         analysisRef       `json:"analysis"`
 	AnalysisRevision uint64            `json:"analysis_revision"`
 	Outputs          []analysisOutput  `json:"outputs"`
@@ -64,6 +69,13 @@ type analysisBar struct {
 	CloseTime time.Time `json:"close_time"`
 	Revision  uint64    `json:"revision"`
 	Status    string    `json:"status"`
+	SourceID  string    `json:"source_id"`
+	Open      float64   `json:"open"`
+	High      float64   `json:"high"`
+	Low       float64   `json:"low"`
+	Close     float64   `json:"close"`
+	Volume    float64   `json:"volume"`
+	Trades    uint64    `json:"trades"`
 }
 
 type analysisRef struct {
@@ -134,6 +146,7 @@ func toAnalysisEvent(event model.SignalEvent, emittedAt time.Time) (analysisEven
 	}
 	data := analysisData{
 		Series: model.SeriesKey{Dataset: event.Dataset, Symbol: event.Symbol, Timeframe: event.Timeframe},
+		Reset:  event.Reset,
 		Bar: analysisBar{
 			OpenTime: event.BarOpenTime.UTC(), CloseTime: event.BarOpenTime.Add(duration).UTC(),
 			Revision: event.BarRevision, Status: status,
@@ -145,6 +158,23 @@ func toAnalysisEvent(event model.SignalEvent, emittedAt time.Time) (analysisEven
 			Engine: "ytstack-native", EngineVersion: event.Algorithm.Version,
 			AlgorithmVersion: event.Algorithm.Version, ConfigHash: event.Algorithm.ConfigHash,
 		},
+	}
+	data.Bar.SourceID = candleSourceID(event.Dataset, event.Symbol, event.Timeframe, event.BarOpenTime, event.BarRevision)
+	if event.SourceBar != nil {
+		data.Bar.Open = event.SourceBar.Open
+		data.Bar.High = event.SourceBar.High
+		data.Bar.Low = event.SourceBar.Low
+		data.Bar.Close = event.SourceBar.Close
+		data.Bar.Volume = event.SourceBar.Volume
+		data.Bar.Trades = event.SourceBar.Trades
+	}
+	for _, bar := range event.ResetHistory {
+		revision := revisionForWireBar(bar)
+		data.History = append(data.History, analysisBar{
+			OpenTime: bar.OpenTime.UTC(), CloseTime: bar.OpenTime.Add(duration).UTC(), Revision: revision,
+			Status: "confirmed", SourceID: candleSourceID(event.Dataset, event.Symbol, event.Timeframe, bar.OpenTime, revision),
+			Open: bar.Open, High: bar.High, Low: bar.Low, Close: bar.Close, Volume: bar.Volume, Trades: bar.Trades,
+		})
 	}
 	switch event.EventType {
 	case "indicator.point":
@@ -167,6 +197,11 @@ func toAnalysisEvent(event model.SignalEvent, emittedAt time.Time) (analysisEven
 		}
 		data.Analysis = analysisRef{Name: event.Algorithm.Name, Parameters: map[string]any{}}
 		data.Outputs = marketOutputs(*event.Market)
+		for _, indicator := range event.Indicators {
+			if indicator.Ready && indicator.Value != nil {
+				data.Outputs = append(data.Outputs, analysisOutput{Name: fmt.Sprintf("ema_%d", indicator.Period), Type: "number", Unit: "price", Value: *indicator.Value})
+			}
+		}
 	default:
 		return analysisEvent{}, fmt.Errorf("unsupported internal event type %q", event.EventType)
 	}
@@ -175,14 +210,21 @@ func toAnalysisEvent(event model.SignalEvent, emittedAt time.Time) (analysisEven
 		return analysisEvent{}, err
 	}
 	eventTime := emittedAt.UTC()
-	if !event.Provisional {
+	if !event.Provisional && !event.Reset {
 		eventTime = data.Bar.CloseTime
 	}
 	return analysisEvent{
 		SpecVersion: "1.0", ID: eventID, Source: eventSource(event.Dataset),
-		Type: analysisEventType, Subject: event.Dataset + "/" + event.Symbol + "/" + event.Timeframe,
+		Type: analysisEventType, Subject: event.Dataset + "/" + event.Symbol + "/" + event.Timeframe, CorrelationID: data.Bar.SourceID,
 		Time: eventTime, DataContentType: "application/json", DataSchema: analysisSchema, Data: data,
 	}, nil
+}
+
+func revisionForWireBar(bar model.Bar) uint64 {
+	if bar.Closed && bar.Trades < ^uint64(0) {
+		return bar.Trades + 1
+	}
+	return bar.Trades
 }
 
 func toAnalysisEvents(events []model.SignalEvent, emittedAt time.Time) ([]analysisEvent, error) {
@@ -197,30 +239,59 @@ func toAnalysisEvents(events []model.SignalEvent, emittedAt time.Time) ([]analys
 	return out, nil
 }
 
+// EncodeAnalysisEvent returns the stable public event sent to external durable
+// transports. Internal reducer payloads must never become a broker contract.
+func EncodeAnalysisEvent(event model.SignalEvent, emittedAt time.Time) ([]byte, error) {
+	converted, err := toAnalysisEvent(event, emittedAt)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(converted)
+}
+
 func snapshotAnalysisEvents(snapshot model.SeriesSnapshot, generatedAt time.Time) ([]analysisEvent, error) {
 	events := make([]model.SignalEvent, 0, len(snapshot.Indicators)+len(snapshot.Provisional)+1)
 	if snapshot.LastClosedTime != nil {
 		for _, state := range snapshot.Indicators {
 			state.AnalysisRevision = snapshot.LastClosedRevision
-			events = append(events, snapshotIndicatorEvent(snapshot.Series, *snapshot.LastClosedTime, state, false))
+			event := snapshotIndicatorEvent(snapshot.Series, *snapshot.LastClosedTime, state, false)
+			event.SourceBar = snapshot.LastClosedBar
+			events = append(events, event)
 		}
 	}
 	if snapshot.FormingOpenTime != nil {
 		for _, state := range snapshot.Provisional {
-			events = append(events, snapshotIndicatorEvent(snapshot.Series, *snapshot.FormingOpenTime, state, true))
+			event := snapshotIndicatorEvent(snapshot.Series, *snapshot.FormingOpenTime, state, true)
+			event.SourceBar = snapshot.FormingBar
+			events = append(events, event)
 		}
 	}
 	if snapshot.Market != nil && !snapshot.Market.AsOf.IsZero() {
 		market := *snapshot.Market
+		periods := make([]int, 0, len(snapshot.Indicators))
+		for _, state := range snapshot.Indicators {
+			periods = append(periods, state.Period)
+		}
+		sort.Ints(periods)
+		algorithm := marketFactsAlgorithm(market.Algorithm, periods)
 		events = append(events, model.SignalEvent{
-			EventID:   syntheticEventID(snapshot.Series, market.AsOf, market.Algorithm, "market"),
+			EventID:   syntheticEventID(snapshot.Series, market.AsOf, algorithm, "market"),
 			EventType: "market.state", Dataset: snapshot.Series.Dataset, Symbol: snapshot.Series.Symbol,
 			Timeframe: snapshot.Series.Timeframe, BarOpenTime: market.AsOf,
 			BarRevision: snapshot.LastClosedRevision, AnalysisRevision: snapshot.LastClosedRevision,
-			Algorithm: market.Algorithm, Market: &market,
+			SourceBar: snapshot.LastClosedBar, Algorithm: algorithm, Market: &market, Indicators: snapshot.Indicators,
 		})
 	}
 	return toAnalysisEvents(events, generatedAt)
+}
+
+func marketFactsAlgorithm(base model.AlgorithmRef, periods []int) model.AlgorithmRef {
+	identity := base.ConfigHash
+	for _, period := range periods {
+		identity += "|" + indicatorConfigHash("ema", indicator.EMAAlgorithmVersion, period)
+	}
+	sum := sha256.Sum256([]byte(identity))
+	return model.AlgorithmRef{Name: base.Name, Version: base.Version, ConfigHash: "sha256:" + hex.EncodeToString(sum[:])}
 }
 
 func snapshotIndicatorEvent(series model.SeriesKey, barTime time.Time, state model.IndicatorState, provisional bool) model.SignalEvent {
@@ -239,6 +310,12 @@ func snapshotIndicatorEvent(series model.SeriesKey, barTime time.Time, state mod
 	}
 }
 
+func candleSourceID(dataset, symbol, timeframe string, openTime time.Time, revision uint64) string {
+	raw := dataset + "|" + symbol + "|" + timeframe + "|" + openTime.UTC().Format(time.RFC3339Nano) + "|" + strconv.FormatUint(revision, 10)
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
+}
+
 func marketOutputs(market model.MarketState) []analysisOutput {
 	return []analysisOutput{
 		{Name: "trend", Type: "text", Value: market.Trend, Display: displayHint{Kind: "state", Pane: "status"}},
@@ -252,8 +329,19 @@ func marketOutputs(market model.MarketState) []analysisOutput {
 		{Name: "liquidity", Type: "levels", Value: levelPrimitives(market.Liquidity), Display: displayHint{Kind: "levels", Pane: "price", Group: "liquidity"}},
 		{Name: "liquidity_sweeps", Type: "markers", Value: patternPrimitives(market.LiquiditySweeps), Display: displayHint{Kind: "markers", Pane: "price", Group: "liquidity"}},
 		{Name: "patterns", Type: "markers", Value: patternPrimitives(market.Patterns), Display: displayHint{Kind: "markers", Pane: "price", Group: "patterns"}},
+		{Name: "pattern_occurrences", Type: "markers", Value: patternPrimitives(market.PatternOccurrences), Display: displayHint{Kind: "markers", Pane: "price", Group: "patterns"}},
+		{Name: "zone_transitions", Type: "markers", Value: zoneTransitionPrimitives(market.ZoneTransitions), Display: displayHint{Kind: "markers", Pane: "price", Group: "zones"}},
 		{Name: "premium_discount", Type: "zones", Value: premiumDiscountPrimitives(market.PremiumDiscount), Display: displayHint{Kind: "zones", Pane: "price", Group: "premium_discount"}},
 	}
+}
+
+func zoneTransitionPrimitives(values []model.ZoneTransition) []pointPrimitive {
+	out := make([]pointPrimitive, 0, len(values))
+	for _, value := range values {
+		price := (value.Zone.Top + value.Zone.Bottom) / 2
+		out = append(out, pointPrimitive{ID: primitiveID("zone_transition", value.Zone.ID+"|"+value.Transition, value.At, price), Time: value.At.UTC(), Value: &price, Label: value.Transition, Direction: canonicalDirection(value.Zone.Side), Attributes: map[string]any{"zone_id": value.Zone.ID, "kind": value.Zone.Kind, "transition": value.Transition, "upper": value.Zone.Top, "lower": value.Zone.Bottom, "source_direction": value.Zone.Side}})
+	}
+	return out
 }
 
 func swingPrimitives(values []model.Swing) []pointPrimitive {
@@ -308,8 +396,15 @@ func zonePrimitives(values []model.PriceZone) []zonePrimitive {
 
 func zonePrimitiveFrom(value model.PriceZone) zonePrimitive {
 	return zonePrimitive{ID: value.ID, StartTime: value.FromTime.UTC(), EndTime: value.ToTime.UTC(),
-		Upper: value.Top, Lower: value.Bottom, Label: value.Kind, Direction: canonicalDirection(value.Side), State: "active",
+		Upper: value.Top, Lower: value.Bottom, Label: value.Kind, Direction: canonicalDirection(value.Side), State: zoneState(value.State),
 		Attributes: map[string]any{"grade": value.Grade, "source_direction": value.Side}}
+}
+
+func zoneState(value string) string {
+	if value == "" {
+		return "active"
+	}
+	return value
 }
 
 func levelPrimitives(values []model.PriceLevel) []levelPrimitive {

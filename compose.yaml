@@ -1,4 +1,25 @@
 services:
+  nats:
+    image: docker.io/library/nats:2.11-alpine
+    command: ["-js", "-sd", "/data", "--auth", "${NATS_AUTH_TOKEN:?set NATS_AUTH_TOKEN in .env}", "-m", "8222"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:4222:4222"
+      - "127.0.0.1:8222:8222"
+    volumes:
+      - signald-nats:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz?js-enabled-only=true"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [backend]
+    logging:
+      driver: json-file
+      options:
+        max-size: "${SIGNALD_LOG_MAX_SIZE:-20m}"
+        max-file: "${SIGNALD_LOG_MAX_FILES:-5}"
+
   postgres:
     image: docker.io/library/postgres:17-alpine
     restart: unless-stopped
@@ -30,6 +51,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      nats:
+        condition: service_healthy
     ports:
       - "${SIGNALD_HTTP_BIND_ADDR:-127.0.0.1}:${SIGNALD_HTTP_PORT:-8090}:8090"
     environment:
@@ -48,6 +71,9 @@ services:
       SIGNALD_ALLOWED_ORIGINS: "${SIGNALD_ALLOWED_ORIGINS:-http://127.0.0.1:8080,http://localhost:8080,http://127.0.0.1:8082,http://localhost:8082,http://127.0.0.1:18110,http://localhost:18110}"
       SIGNALD_SHUTDOWN_TIMEOUT: "${SIGNALD_SHUTDOWN_TIMEOUT:-15s}"
       SIGNALD_OUTBOX_POLL_INTERVAL: "${SIGNALD_OUTBOX_POLL_INTERVAL:-250ms}"
+      SIGNALD_NATS_URL: "nats://nats:4222"
+      SIGNALD_NATS_TOKEN: "${NATS_AUTH_TOKEN:?set NATS_AUTH_TOKEN in .env}"
+      SIGNALD_NATS_REPLICAS: "${NATS_REPLICAS:-1}"
       SIGNALD_LOG_LEVEL: "${SIGNALD_LOG_LEVEL:-info}"
     read_only: true
     tmpfs:
@@ -64,6 +90,8 @@ services:
 volumes:
   signald-postgres:
     name: "${SIGNALD_POSTGRES_VOLUME:-signald_postgres-data}"
+  signald-nats:
+    name: "${SIGNALD_NATS_VOLUME:-signald_nats-data}"
 
 networks:
   backend:

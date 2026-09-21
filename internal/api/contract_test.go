@@ -41,8 +41,10 @@ func TestToAnalysisEventPublishesMarketAsTypedOutputs(t *testing.T) {
 	event, err := toAnalysisEvent(model.SignalEvent{
 		EventID: "event-2", EventType: "market.state", Dataset: "binance-spot",
 		Symbol: "BTCUSDT", Timeframe: "5m", BarOpenTime: barTime,
-		Algorithm: model.AlgorithmRef{Name: "market_structure", Version: "1", ConfigHash: "sha256:test"},
-		Market:    &model.MarketState{Trend: "up", FVGs: []model.PriceZone{{ID: "fvg-1", Kind: "fvg"}}},
+		Algorithm:  model.AlgorithmRef{Name: "market_structure", Version: "1", ConfigHash: "sha256:test"},
+		SourceBar:  &model.Bar{OpenTime: barTime, Open: 100, High: 103, Low: 99, Close: 102, Volume: 5, Trades: 7},
+		Market:     &model.MarketState{Trend: "up", FVGs: []model.PriceZone{{ID: "fvg-1", Kind: "fvg"}}},
+		Indicators: []model.IndicatorState{{Period: 200, Ready: true, Value: floatPointer(101)}},
 	}, barTime.Add(5*time.Minute))
 	if err != nil {
 		t.Fatal(err)
@@ -54,7 +56,12 @@ func TestToAnalysisEventPublishesMarketAsTypedOutputs(t *testing.T) {
 	if outputs["trend"].Type != "text" || outputs["fvgs"].Type != "zones" || outputs["structure"].Type != "markers" {
 		t.Fatalf("market outputs are not self-describing: %+v", outputs)
 	}
+	if outputs["ema_200"].Value != float64(101) || event.CorrelationID == "" || event.Data.Bar.Close != 102 {
+		t.Fatalf("market event is not a complete alert fact: %+v", event)
+	}
 }
+
+func floatPointer(value float64) *float64 { return &value }
 
 func TestSnapshotAnalysisEventsUsesFormingBarIdentity(t *testing.T) {
 	closedTime := time.Date(2026, 9, 6, 10, 4, 0, 0, time.UTC)

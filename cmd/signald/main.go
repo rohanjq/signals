@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,9 +13,11 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/rohanjq/signals/internal/api"
+	"github.com/rohanjq/signals/internal/broker"
 	"github.com/rohanjq/signals/internal/config"
 	"github.com/rohanjq/signals/internal/engine"
 	"github.com/rohanjq/signals/internal/input"
+	"github.com/rohanjq/signals/internal/model"
 	"github.com/rohanjq/signals/internal/monitor"
 	"github.com/rohanjq/signals/internal/outbox"
 	"github.com/rohanjq/signals/internal/store"
@@ -25,6 +28,52 @@ type serviceStore interface {
 	api.EventStore
 	outbox.Store
 	Close()
+}
+
+type hubPublisher struct{ hub *api.Hub }
+
+func (p hubPublisher) Publish(_ context.Context, event model.SignalEvent) error {
+	p.hub.Publish(event)
+	return nil
+}
+
+type evaluationBrokerPublisher struct {
+	stream *broker.JetStream
+	logger *slog.Logger
+	ctx    context.Context
+}
+
+func (p evaluationBrokerPublisher) Publish(event model.SignalEvent) {
+	for {
+		publishCtx, cancel := context.WithTimeout(p.ctx, 2*time.Second)
+		err := p.stream.PublishEvaluation(publishCtx, event)
+		cancel()
+		if err == nil || p.ctx.Err() != nil {
+			return
+		}
+		p.logger.Warn("publish evaluation fact", "series", event.Dataset+"/"+event.Symbol+"/"+event.Timeframe, "provisional", event.Provisional, "err", err)
+		if event.Provisional && errors.Is(err, broker.ErrReplaceableEvaluation) {
+			// Snapshots repaint and are replaceable. Confirmed and transition frames
+			// take the retry/backpressure path below.
+			return
+		}
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+type multiPublisher []outbox.Publisher
+
+func (publishers multiPublisher) Publish(ctx context.Context, event model.SignalEvent) error {
+	for _, publisher := range publishers {
+		if err := publisher.Publish(ctx, event); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func main() {
@@ -52,14 +101,28 @@ func run() error {
 	defer persistence.Close()
 
 	hub := api.NewHub()
+	metrics := monitor.NewMetrics()
+	publishers := multiPublisher{}
+	var jetstream *broker.JetStream
+	var livePublisher engine.Publisher
+	if settings.NATSURL != "" {
+		jetstream, err = broker.Open(ctx, settings.NATSURL, settings.NATSToken, settings.NATSReplicas)
+		if err != nil {
+			return fmt.Errorf("open fact publisher: %w", err)
+		}
+		defer jetstream.Close()
+		publishers = append(publishers, jetstream)
+		livePublisher = evaluationBrokerPublisher{stream: jetstream, logger: logger, ctx: ctx}
+		logger.Info("JetStream fact publisher enabled")
+	}
 	registry, err := engine.NewRegistry(engine.RegistryOptions{
 		Series: settings.Series, Periods: settings.Periods, MailboxSize: settings.MailboxSize,
-		SnapshotEvery: settings.SnapshotEvery, Store: persistence, Publisher: hub, OutboxDelivery: true,
+		SnapshotEvery: settings.SnapshotEvery, Store: persistence, Publisher: hub,
+		LivePublisher: livePublisher, OutboxDelivery: true,
 	})
 	if err != nil {
 		return fmt.Errorf("create lane registry: %w", err)
 	}
-	metrics := monitor.NewMetrics()
 	upstream, err := input.NewOHLCClient(input.OHLCOptions{
 		URL: settings.OHLCWebSocketURL, Token: settings.OHLCToken, Series: settings.Series,
 		SeedBars: settings.SeedBars, Sink: registry, Metrics: metrics, Logger: logger,
@@ -75,7 +138,14 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("create API server: %w", err)
 	}
-	dispatcher := outbox.New(persistence, hub, settings.OutboxPollInterval, logger, metrics)
+	publishers = append(publishers, hubPublisher{hub: hub})
+	dispatcher := outbox.New(persistence, publishers, settings.OutboxPollInterval, logger, metrics)
+	// Recover committed confirmed events before accepting new OHLC input. This
+	// prevents a next-candle provisional frame from overtaking a confirmed event
+	// after a process crash between database commit and broker publication.
+	if err := dispatcher.Flush(ctx); err != nil {
+		return fmt.Errorf("recover signal outbox before live input: %w", err)
+	}
 
 	group, groupCtx := errgroup.WithContext(ctx)
 	registry.Start(groupCtx)

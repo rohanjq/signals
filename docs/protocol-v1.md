@@ -76,10 +76,11 @@ replay, and live delivery use the same ID for the same analytical occurrence.
   "id": "34a5...",
   "source": "urn:ytstack:signals:dataset:YmluYW5jZS1zcG90",
   "type": "io.ytstack.signals.analysis.updated.v1",
-  "subject": "binance-spot/BTCUSDT/1m",
+  "subject": "live/BTCUSDT/1m",
   "time": "2026-09-06T10:06:00Z",
   "datacontenttype": "application/json",
   "dataschema": "urn:ytstack:signals:schema:analysis:v1",
+  "correlationid": "deterministic-source-candle-id",
   "data": {
     "series": {
       "dataset": "binance-spot",
@@ -90,7 +91,14 @@ replay, and live delivery use the same ID for the same analytical occurrence.
       "open_time": "2026-09-06T10:05:00Z",
       "close_time": "2026-09-06T10:06:00Z",
       "revision": 3,
-      "status": "confirmed"
+      "status": "confirmed",
+      "source_id": "deterministic-source-candle-id",
+      "open": 107.5,
+      "high": 109.0,
+      "low": 107.0,
+      "close": 108.4,
+      "volume": 42.1,
+      "trades": 2
     },
     "analysis": {
       "name": "bbands",
@@ -156,7 +164,7 @@ Points and markers require stable `id` and `time`; they may include `value`,
 `direction` is one of `bullish`, `bearish`, or `neutral`. It communicates
 analytical direction, never an instruction to buy or sell.
 
-Generic zone lifecycle state is one of `pending`, `active`, `mitigated`,
+Generic zone lifecycle state is one of `pending`, `active`, `touched`, `mitigated`,
 `invalidated`, or `expired`. Algorithm-specific state and metadata belong in
 `attributes`. Fields needed for generic interpretation belong in the core
 primitive. `attributes` may be ignored by generic consumers.
@@ -174,7 +182,7 @@ message must be:
   "request_id": "1b88fb9c-...",
   "data": {
     "series": [
-      {"dataset": "binance-spot", "symbol": "BTCUSDT", "timeframe": "1m"}
+      {"dataset": "live", "symbol": "BTCUSDT", "timeframe": "1m"}
     ],
     "analyses": [{"name": "*"}],
     "event_types": ["io.ytstack.signals.analysis.updated.v1"],
@@ -247,9 +255,33 @@ commercial multi-user product must use an API gateway or backend-for-frontend
 to authorize users, series, analyses, alert rules, and rate limits. Never ship
 the service token in a public bundle.
 
-Correlation and causation CloudEvents extensions should be added only when IDs
-can be propagated from upstream market data through analysis and alerting. V1
-does not fabricate tracing ancestry.
+`correlationid` and `bar.source_id` contain the deterministic candle identity
+shared by every analysis of the same source revision. This allows downstream
+assemblers and alert engines to reject mismatched facts without inventing
+tracing ancestry.
+
+The confirmed `smc.market_state` event is also the complete alert-fact frame:
+it carries candle OHLC, current EMA outputs (`ema_<period>`), active zone state,
+current-bar `pattern_occurrences`, and explicit `zone_transitions`. Consumers
+must not join independent EMA messages to reconstruct a confirmed candle.
+The production dispatcher publishes these frames to the JetStream
+`MARKET_FACTS` stream only after they have been committed to the Signals
+transactional outbox. The outbox row is marked published only after the broker
+acknowledges durable storage.
+
+Alert evaluators consume the single `MARKET_EVALUATION` stream through
+`signals.evaluation.<000..255>.>`. Confirmed frames, provisional transitions,
+and coalesced snapshots therefore share one authoritative sequence per logical
+partition. Confirmed and transition subjects are retained for seven days.
+Steady provisional snapshots are capped at one per second and published with a
+per-series JetStream rollup header, so only the latest replaceable heartbeat is
+kept while state transitions remain lossless.
+
+An authoritative OHLC correction emits `data.reset=true` plus up to 500 prior
+confirmed bars in `data.history`. The reset event time is the rebuild time (not
+the corrected candle close). Downstream evaluators replace their future state
+from that baseline but do not retract immutable alerts already delivered under
+the documented live-as-known policy.
 
 ## Backend replacement rules
 
