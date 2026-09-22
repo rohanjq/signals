@@ -47,6 +47,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    image: signals:local
     restart: unless-stopped
     depends_on:
       postgres:
